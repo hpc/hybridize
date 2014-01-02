@@ -1,0 +1,543 @@
+#!/usr/bin/perl -w
+# Copyright (C) 2013 Daryl W. Grunau
+# Copyright (C) 2013 Ben McClelland
+#
+# Unless otherwise indicated, this information has been authored by an employee
+# or employees of the Los Alamos National Security, LLC (LANS), operator of the
+# Los Alamos National Laboratory under Contract No.  DE-AC52-06NA25396 with the
+# U.S. Department of Energy.  The U.S. Government has rights to use, reproduce,
+# and distribute this information. The public may copy and use this information
+# without charge, provided that this Notice and any statement of authorship are
+# reproduced on all copies. Neither the Government nor LANS makes any warranty,
+# express or implied, or assumes any liability or responsibility for the use of
+# this information.
+#
+# This program has been approved for release from LANS by LA-CC Number 10-066,
+# being part of the HPC Operational Suite.
+
+$| = 1;
+(my $prog = $0) =~ s|.*/||;
+
+use 5.005;			# for 'qr//'
+use Pod::Usage;
+use Getopt::Long;
+use File::Find ();
+use Cwd 'abs_path';
+use File::Glob ':glob';
+use List::MoreUtils 'any';
+
+my $globmeta = '\[]{}*?';	# glob meta characters
+$globmeta = join ('|', map { quotemeta } split(//, $globmeta));
+$globmeta = qr/($globmeta)/o;	# glob meta chars as a regexp
+
+&Getopt::Long::config(
+   'require_order',		# don't mix non-options with options
+   'auto_abbrev',		# allow unique option abbreviation
+   'bundling',			# allow bundling of options
+);
+
+our $opt_man;			# help
+our $opt_help;			# print the manpage
+our $opt_debug;			# print debug output
+our $opt_output='-';		# output file (default: STDOUT)
+our $opt_RAM_list;		# RAM file list
+our @opt_link_exceptions;	# Exceptions to bringing in link referents to whitelist
+
+pod2usage(2) unless &GetOptions(
+   'm|man'		=> \$opt_man,
+   'h|help'		=> \$opt_help,
+   'd|debug'		=> \$opt_debug,
+   'o|output=s'		=> \$opt_output,
+   'f|r|l|ram-list=s'	=> \$opt_RAM_list,
+   'e|exception=s@'	=> \@opt_link_exceptions,
+);
+
+pod2usage(1) if (defined($opt_help));
+if ($opt_man) {				# print the man page
+   $ENV{'LANG'} = 'C';
+   if ($< && $>) {			# no root privs
+      pod2usage(-verbose => 2);
+   } else {
+      my $id = getpwnam("nobody") || getpwnam("nouser") || -2;
+      eval {
+	 $> = $id;			# drop euid first
+	 $< = $id;			# drop ruid
+      };
+      if (!$@ && $< && $>) {		# success!
+	 pod2usage(-verbose => 2)
+      } else {				# failure!
+	 pod2usage(1);
+      }
+   }
+}
+
+pod2usage("$prog: no vnfs directory specified!")
+   unless (scalar @ARGV);
+our $vnfs_root = shift(@ARGV);
+-d $vnfs_root || die "$prog: $vnfs_root: $!\n";
+$vnfs_root =~ s/\/+$//;			# strip off one or more trailing "/"
+
+# compare RPM revisions
+# return 1: rev1 is newer than rev2
+#        0: rev1 and rev2 are the same version
+#       -1: rev2 is newer than rev1
+#    undef: comparison is impossible
+sub rpmRevCompare ($$) {
+   my ($r1, $r2) = @_;
+   my $rc = undef;
+
+   my ($e1, $rev1) = split(':', $r1);		# epoch/revision
+   my ($e2, $rev2) = split(':', $r2);		# epoch/revision
+
+   # easy epoch comparison
+   $rc = ($e1 <=> $e2);
+   if (defined($rc)) {
+      return $rc if $rc;
+   }
+
+   my ($vers1, $rel1) = split('-',$rev1);	# version/release
+   my ($vers2, $rel2) = split('-',$rev2);	# version/release
+
+   if ($opt_debug) {
+      print STDOUT "\tVersion 1 = $vers1, Release 1 = $rel1\n";
+      print STDOUT "\tVersion 2 = $vers2, Release 2 = $rel2\n";
+   }
+
+   $rc = &_rpmrevcmp($vers1, $vers2);
+   if (defined($rc)) {
+      return $rc if $rc;
+   } else {
+      return undef;				# incomparable version
+   }
+
+   return &_rpmrevcmp($rel1, $rel2);
+}
+
+# From: lib/rpmvercmp.c
+# compare alpha and numeric segments of two versions
+# return 1: a is newer than b
+#        0: a and b are the same version
+#       -1: b is newer than a
+sub _rpmrevcmp ($$) {
+   my ($a, $b) = @_;
+
+   # easy comparison to see if versions are identical
+   return 0 if ($a eq $b);
+
+   my @a_segments = split(/[^a-z0-9]+/i, $a);		# alnum segments
+   my @b_segments = split(/[^a-z0-9]+/i, $b);		# alnum segments
+
+   if ($opt_debug) {
+      print STDOUT "\t\tA segments: ", join(' ', @a_segments) . "\n";
+      print STDOUT "\t\tB segments: ", join(' ', @b_segments) . "\n";
+   }
+
+   # loop through each version segment of a and b and compare
+SEG: while (scalar(@a_segments) && scalar(@b_segments)) {
+      my $str1 = shift(@a_segments);
+      my $str2 = shift(@b_segments);
+
+      if (($str1 =~ /^\d+$/) && ($str2 =~ /^\d+$/)) {	# isdigit
+	 my $rc = ($str1 <=> $str2);
+	 return $rc if $rc;
+      } elsif (($str1 =~ /^[a-z]+$/i) &&
+	 (($str2 =~ /^[a-z]+$/i))) {			# isalpha
+	 my $rc = ($str1 cmp $str2);
+	 return $rc if $rc;
+      } else {						# isalnum
+         my @a_subseg = ($str1 =~ /([a-z]+|\d+)/ig);
+         my @b_subseg = ($str2 =~ /([a-z]+|\d+)/ig);
+
+	 if ($opt_debug) {
+	    print STDOUT "\t\t\tA subsegments (" . scalar(@a_subseg) . "): " . join(',', @a_subseg) . "\n";
+	    print STDOUT "\t\t\tB subsegments (" . scalar(@b_subseg) . "): " . join(',', @b_subseg) . "\n";
+	 }
+
+	 # loop through each (alpha/digit) subsegment of a and b and compare
+	 while (scalar(@a_subseg) && scalar(@b_subseg)) {
+	    my $substr1 = shift(@a_subseg);
+	    my $substr2 = shift(@b_subseg);
+
+	    if ($opt_debug) {
+	       print STDOUT "\t\t\t\tA substring = $substr1\n";
+	       print STDOUT "\t\t\t\tB substring = $substr2\n";
+	    }
+
+	    if (($substr1 =~ /^\d+$/) && ($substr2 =~ /^\d+$/)) {	# digit
+	       my $rc = ($substr1 <=> $substr2);
+	       return $rc if $rc;
+	    } elsif (($substr1 =~ /^[a-z]+$/i) &&			# alpha
+	       (($substr2 =~ /^[a-z]+$/i))) {
+	       my $rc = ($substr1 cmp $substr2);
+	       return $rc if $rc;
+	    } else {			# comparison of a digit & alpha -
+					# see patch #60884 (and details)
+					# from bugzilla.redhat.com #50977
+	       return 1 if ($substr1 =~ /^\d+$/);	# digits win over
+	       return -1;				# alphas!
+	    }
+
+	 }
+
+	 # all subsegments have compared identically
+	 next SEG if ((!scalar(@a_subseg)) && (!scalar(@b_subseg)));
+
+	 # whichever subsegment still has characters left over wins
+	 if (!scalar(@a_subseg)) {
+	    return -1
+	 } else {
+	    return 1;
+	 }
+
+      }
+   }
+
+   # all segments have compared identically
+   return 0 if ((!scalar(@a_segments)) && (!scalar(@b_segments)));
+
+   # whichever version still has characters left over wins
+   if (!scalar(@a_segments)) {
+      return -1
+   } else {
+      return 1;
+   }
+}
+
+our $rpm_root = (length $vnfs_root
+   ? "--root $vnfs_root"
+   : ''
+);
+
+# Pre-process the kver from the vnfs_root and substitute in the whitelist.
+our %KRPMs = ();
+our $KVER = undef;
+our $fmt = q|'%{EPOCH}:%{VERSION}-%{RELEASE} %{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n'|;
+if (-d "$vnfs_root/lib/modules") {
+   if (opendir (KVER, "$vnfs_root/lib/modules")) {
+kmDIR:foreach my $kmdir ( grep { $_ !~ /^\.{1,2}$/ } readdir(KVER) ) {
+	 if (open (RPMQF,
+	       "/bin/rpm $rpm_root -q -f /lib/modules/$kmdir --qf $fmt |")) {
+	    while (defined(my $string = <RPMQF>)) {
+	       chomp $string;
+	       my ($revision, $rpm) = split (/\s+/, $string);
+	       $revision =~ s/^\(none\)/0/;
+	       if (open (RPMQL, "/bin/rpm $rpm_root -ql $rpm |")) {
+		  while (defined(my $list = <RPMQL>)) {
+		     chomp $list;
+		     if ($list =~ /^\/boot\/vmlinuz-/) {	# this RPM provides a kernel!
+			$KRPMs{$revision} = {
+			   'dir'	=> $kmdir,
+			   'kernel'	=> $list,
+			};
+			close RPMQL;
+			close RPMQF;
+			next kmDIR;
+		     }
+		  }
+	       }
+	    }
+	 }
+      }
+      closedir KVER;
+
+      foreach my $revision (sort { rpmRevCompare($b,$a) } keys %KRPMs) {
+	 $KVER = $KRPMs{$revision}->{'dir'};
+	 if (-e "$vnfs_root$KRPMs{$revision}->{'kernel'}") {
+	    my $amtime = time;
+	    utime $amtime, $amtime,				# touch /boot/vmlinuz-v.e.r.s
+	       "$vnfs_root$KRPMs{$revision}->{'kernel'}";	# for PPSST
+	 }
+	 print STDERR "debug: $vnfs_root: KVER = $KVER\n"
+	    if ($opt_debug);
+	 last;
+      }
+   }
+}
+
+pod2usage("$prog: no ram file list specified!")
+   unless (defined($opt_RAM_list));
+
+# Pre-process the whitelist for valid entries.
+our @RAM_list = ();
+open(LIST, $opt_RAM_list) || die "$prog: unable to open $opt_RAM_list: $!\n";
+while (defined(my $entry = <LIST>)) {
+   chomp $entry;
+   next if ($entry =~ /^#/);		# comments
+   $entry =~ s/#.*$//;			# strip off trailing comments
+   $entry =~ s/\s+$//;			# strip off trailing spaces
+   $entry =~ s/\/+$//;			# strip off one or more trailing "/"
+   $entry =~ s/\/{2,}/\//g;		# reduce multiple "/" to single
+   next if ($entry =~ /^\s*$/);		# white space
+   die "$prog: $opt_RAM_list: error: line $. does not specify a fully-qualified path.\n"
+      unless ($entry =~ /^\//);
+   if (defined($KVER)) {
+      $entry =~ s/\@KVER\@/$KVER/g;	# substitute @KVER@
+   } elsif ($entry =~ /\@KVER\@/) {
+      die "$prog: KVER: substitute requested but no unique version found.\n"
+   }
+   if (-e "$vnfs_root$entry") {
+      push (@RAM_list, $entry);
+   } elsif ($entry =~ /$globmeta/) {	# entry looks like a fileglob
+      my @Globs = bsd_glob("$vnfs_root$entry",
+	 GLOB_BRACE | GLOB_NOCHECK | GLOB_NOSORT | GLOB_QUOTE);
+      if (scalar @Globs) {
+	 foreach my $gentry (@Globs) {
+	    if (-e "$gentry") {
+	       $gentry =~ s/^\Q$vnfs_root\E//; push (@RAM_list, $gentry);
+	    } else {			# skip non-existent vnfs glob matches
+	       print STDERR "debug: $gentry: No such file or directory, skipping.\n"
+		  if ($opt_debug);
+	    }
+	 }
+      } else {				# skip non-existent vnfs entries
+	 print STDERR "debug: $vnfs_root$entry: No such file or directory, skipping.\n"
+	    if ($opt_debug);
+      }
+   } else {				# skip non-existent vnfs entries
+      print STDERR "debug: $vnfs_root$entry: No such file or directory, skipping.\n"
+	 if ($opt_debug);
+   }
+}
+close(LIST);
+
+# Process the whitelist.  Identify dirnames containing whitelist files.  If
+# a file here is actually a symlink, both the symlink AND the absolute path
+# to the target must exist in the ramdisk!!!
+our %WhiteList = ();
+our %WhiteDirs = ();
+foreach my $entry (@RAM_list) {
+   foreach my $exc (@opt_link_exceptions) {
+      if ($entry =~ /^$exc\//) {
+         $entry = "/usr$entry";
+      }
+   }
+   $WhiteList{$entry}++;
+   if (-l "$vnfs_root$entry" &&  any { /^$entry$/ } @opt_link_exceptions) {
+      print STDERR "debug: (L) $vnfs_root$entry -> EXCEPTION!\n"
+         if ($opt_debug);
+      next;    # found a link in the exceptions list, skip referent
+   }
+   elsif (-l "$vnfs_root$entry") {		# the entry is a symlink!
+      (my $_dir = "$vnfs_root$entry") =~
+	 s/^(.*)\/[^\\]+$/$1/;		# strip off the non-directory part
+      my $referent = readlink("$vnfs_root$entry");
+      if ((my $a_referent = abs_path("$_dir/$referent"))) {
+	 ($referent = $a_referent) =~ s/^\Q$vnfs_root\E//;	# strip off "$vnfs_root"
+      } else {	# the referent is not relative to $vnfs_root, rather to "/"!
+	 unless ($referent =~ /^\//) {
+	    warn "$prog: $vnfs_root$entry -> $referent:\n\t does not specify a fully-qualified path; skipping\n";
+	    next;
+	 }
+	 unless (-e "$vnfs_root$referent") {	# skip non-existent vnfs entries
+	    warn "$prog: $vnfs_root$entry -> $referent:\n\t does not exist in the vnfs; skipping\n";
+	    next;
+	 }
+      }
+      foreach my $exc (@opt_link_exceptions) {
+         if ($referent =~ /^$exc\//) {
+            $referent = "/usr$referent";
+         }
+      }
+      $WhiteList{$referent}++;
+      print STDERR "debug: (L) $vnfs_root$entry -> $vnfs_root$referent\n"
+	 if ($opt_debug);
+
+      if (-d "$vnfs_root$referent") {
+	 $WhiteDirs{$referent}++;
+	 File::Find::find			# find symlinks beneath
+	    (					# the whitelist directory
+	       {				# whose referents point
+		  wanted => \&wanted,		# outside the directory's
+		  no_chdir => 1,		# root.
+	       },
+	       "$vnfs_root$referent"
+	    );
+      }
+   }
+
+   if (-d "$vnfs_root$entry") {
+      $WhiteDirs{$entry}++;
+      File::Find::find				# find symlinks beneath
+	 (					# the whitelist directory
+	    {					# whose referents point
+	       wanted => \&wanted,		# outside the directory's
+	       no_chdir => 1,			# root.
+	    },
+	    "$vnfs_root$entry"
+	 );
+   }
+}
+
+# Preen all but topmost whitelist directory entries
+foreach my $dirent (keys %WhiteDirs) {
+   (my $parent = $dirent) =~ s/^(.*)\/[^\\]+$/$1/;	# strip last component
+   while ($parent ne '') {
+      delete $WhiteDirs{$dirent} if (exists $WhiteDirs{$parent});
+      $dirent = $parent;
+      $parent =~ s/^(.*)\/[^\\]+$/$1/;
+   }
+}
+
+our $list_re = join ('|', map { quotemeta } keys %WhiteList);
+$list_re = qr/^($list_re)$/o;		# whitelist files as a regexp
+
+our $dirs_re = join ('\/|', map { quotemeta } keys %WhiteDirs) . '\/';
+$dirs_re = qr/^($dirs_re)/o;		# whitelist directories as a regexp
+
+# Process the vnfs_root subdirectory structure containing whitelist files.
+# Whitelist directories are never opendir'd so none of their subcontents
+# will show up in the blacklist!
+our %BlackList = ();			# symlink files
+foreach my $dirent (keys %WhiteList) {
+   next if ($dirent =~ /$dirs_re/);	# preen subdir files of whitelist dirs
+   $dirent =~ s/^(.*)\/[^\\]+$/$1/;	# strip off the last component
+   while ($dirent ne '') {
+      opendir (DIR, "$vnfs_root$dirent") ||
+	 die "$prog: unable to opendir '$vnfs_root$dirent': $!\n";
+F:    while (defined(my $f = readdir(DIR))) {
+	 next F if ($f =~ /^\.{1,2}$/);	# strip "." and ".."
+	 my $file = "$dirent/$f";
+	 next F if ($file =~ /$list_re/);# skip whitelist files
+	 $BlackList{$file}++;
+      }
+      closedir(DIR);
+      $dirent =~ s/^(.*)\/[^\\]+$/$1/;
+   }
+}
+
+# Process the vnfs_root topdir containing whitelist files.
+opendir (DIR, $vnfs_root) ||
+   die "$prog: unable to opendir '$vnfs_root': $!\n";
+while (defined(my $f = readdir(DIR))) {
+   next if ($f =~ /^\.{1,2}$/);		# strip "." and ".."
+   my $file = "/$f";
+   next if ($file =~ /$list_re/);	# skip whitelist files
+   $BlackList{$file}++;
+}
+closedir(DIR);
+
+# Ensure that the complete path to whitelist files never appear in the
+# blacklist.
+foreach my $entry (keys %WhiteList) {
+   while ($entry ne '') {
+      if (exists $BlackList{$entry}) {
+	 delete $BlackList{$entry};
+	 print STDERR "debug: preening $entry from blacklist.\n"
+	    if ($opt_debug);
+      }
+      $entry =~ s/^(.*)\/[^\\]+$/$1/;
+   }
+}
+
+open (OUTPUT, ">$opt_output") || die "$prog: unable to open '$opt_output': $!\n";
+select((select($opt_output), $| = 1)[0]);
+print OUTPUT join("\n", sort keys %BlackList) . "\n";
+close OUTPUT;
+
+exit 0;
+
+sub wanted {
+   my ($dev,$ino,$mode,$nlink,$uid,$gid,$ref);
+
+   (($dev,$ino,$mode,$nlink,$uid,$gid) = lstat($_)) &&
+   -l _ &&
+   ($ref = readlink($_)) &&
+   ($ref = abs_path("$File::Find::dir/$ref")) &&
+    $ref !~ /^\Q$File::Find::topdir\E/ &&	# referent is outside the whitelist dir
+   ($ref =~ s/^\Q$vnfs_root\E//) &&		# strip off "$vnfs_root"
+   ($WhiteList{$ref}++) &&
+    $opt_debug &&
+    print STDERR "debug: (W) $_ -> $vnfs_root$ref\n"
+}
+
+# Documentation
+
+=head1 NAME
+
+B<hybridize> - generate an optimal rootfs hybridize list
+
+=head1 SYNOPSIS
+
+B<hybridize> [B<--help>] [B<--man>]
+
+B<hybridize> [B<--debug>] [B<--exception> I<link>] [B<--output> I<file>] B<--ram-list> <I<file>> I</path/to/vnfs/root>
+
+=head1 DESCRIPTION
+
+B<hybridize> generates a list of files and/or directories suitable for
+building hybrid Perceus VNFS capsules.  The list is optimal in the sense
+that it contains a minimal set of symbolic links back into the VNFS while
+ensuring that entries from I<file> reside in RAM.  The generated list is
+unique to the I</vnfs/root> provided on the command line.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-h,--help>
+
+Show command usage and exit.
+
+=item B<-m,--man>
+
+Print the hybridize(1) manpage and exit.
+
+=item B<-d,--debug>
+
+Print runtime discovery and decision events to STDERR as B<hybridize> runs.
+
+=item B<-o,--output> I<file>
+
+Print the hybridize list to I<file> (default: STDOUT), overwriting I<file>
+if it pre-exists.
+
+=item B<-e,--exception> I<link>
+
+Entries in the whitelist that are symlinks in the rootfs implicitly bring 
+the item(s) referenced by the link into the whitelist as well.  Newer
+distributions are linking I</{bin,sbin,lib,lib64}> to I</usr/{bin,sbin,lib,lib64}>.
+It is necessary to include these links in RAM for compatibility of references
+to the link path, but unnecessary for all reference(s) to be in RAM.  The
+required assumption for the exception list is that the I<link> argument 
+references I</usr/link>.  Multiple -exceptions are allowed by:
+  B<-e,--exception> I<link1> B<-e,--exception> I<link2>
+
+=item B<-f,-l,-r,--ram-list> I<file>
+
+Identify the list of files that must exist in RAM from the contents of
+I<file>.  Entries are listed one per line followed by an optional hash
+comment, "#", which is stripped off from ram-list processing.  Blank-empty
+and/or hash-commented lines are treated likewise.  Directory entries may be
+specified in I<file>, implying to B<hybridize> that it, and its entire
+subcontents will reside in RAM.  A subset of glob(3) meta characters
+(B<\[]{}*?>) may be also used to generate filenames which match a pattern.
+Additionally, if the keyword "@KVER@" is found in I<file> it will be
+substituted with the newest (in the RPM sense) kernel version located in
+the I</vnfs/root> provided on the command line.  The ram-list I<file> is a
+MANDATORY option to B<hybridize>.
+
+=back
+
+=head1 AUTHOR
+
+Daryl W. Grunau <dwg@lanl.gov>
+Ben McClelland <ben@lanl.gov>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 2013 Daryl W. Grunau
+
+Unless otherwise indicated, this information has been authored by an employee
+or employees of the Los Alamos National Security, LLC (LANS), operator of the
+Los Alamos National Laboratory under Contract No.  DE-AC52-06NA25396 with the
+U.S. Department of Energy.  The U.S. Government has rights to use, reproduce,
+and distribute this information. The public may copy and use this information
+without charge, provided that this Notice and any statement of authorship are
+reproduced on all copies. Neither the Government nor LANS makes any warranty,
+express or implied, or assumes any liability or responsibility for the use of
+this information.
+
+This program has been approved for release from LANS by LA-CC Number 10-066,
+being part of the HPC Operational Suite.
+
+=cut
