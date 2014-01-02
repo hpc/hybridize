@@ -5,7 +5,7 @@ Generate an optimal rootfs hybridize list of files that should be symlinked to N
 
 Usage
 -----
-hybridize is called from within ppsst (createimg).  There is a requirement of only 1 kernerl installed into the rootfs so that hybridize can determine what to replace the @KVER@ varliable with in the whitelist.  The basic usage is as follows:
+hybridize is called from within [ppsst](http://github.com/hpc/ppsst) (createimg).  There is a requirement of only 1 kernerl installed into the rootfs so that hybridize can determine what to replace the @KVER@ varliable with in the whitelist.  The basic usage is as follows:
 ```
    hybridize -f /path/to/image/whitelist $HYBRID_OPTS -o /path/to/image/hybridize
 ```
