@@ -14,4 +14,4 @@ The output file called hybridize in the example above is used to repalce those f
 
 Example Whitelist Files
 -----------------------
-These are files that are currently used to boot RHEL/TOSS images as well as an example for a Fedora 18 image.  These are not guranteed to be as minimal as possible.  There may be additional requirements for other device drivers or other services needed before the NFS mount happens.  But these should give a good starting point.  Typical resulting image sizes are on the order of 100MB with a ill 20+GB distro available to the node once the NFS mount completes.
+These are files that are currently used to boot RHEL/TOSS images as well as an example for a Fedora 18 image.  These are not guranteed to be as minimal as possible.  There may be additional requirements for other device drivers or other services needed before the NFS mount happens.  But these should give a good starting point.  Typical resulting image sizes are on the order of 100MB with a full 20+GB distro available to the node once the NFS mount completes.
